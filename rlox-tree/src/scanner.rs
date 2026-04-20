@@ -2,9 +2,10 @@
 //!
 //! The scanner consumes a source string and produces a `Vec<Token>` terminated
 //! by a single `TokenType::Eof` token. It tracks line numbers, supports
-//! multi-line strings (without escapes, per the book), and reports the first
-//! syntactic error as a `LoxError::Syntax` (matching the error convention
-//! used by the parser, resolver, and interpreter stages).
+//! multi-line strings (without escapes, per the book), and accumulates every
+//! syntactic error it encounters into a `Vec<LoxError>` (mirroring jlox's
+//! `hadError`-style reporting). Scanning continues past individual errors so
+//! downstream stages can still report follow-up issues.
 
 use crate::error::LoxError;
 use crate::token::{Literal, Token, TokenType};
@@ -14,6 +15,7 @@ pub struct Scanner<'a> {
     source: &'a str,
     source_bytes: &'a [u8],
     tokens: Vec<Token>,
+    errors: Vec<LoxError>,
     /// Byte offset of the first char of the lexeme currently being scanned.
     start: usize,
     /// Byte offset of the next char to consume.
@@ -28,6 +30,7 @@ impl<'a> Scanner<'a> {
             source,
             source_bytes: source.as_bytes(),
             tokens: Vec::new(),
+            errors: Vec::new(),
             start: 0,
             current: 0,
             line: 1,
@@ -35,18 +38,36 @@ impl<'a> Scanner<'a> {
     }
 
     /// Scan the entire source, returning either the produced tokens (ending in
-    /// `Eof`) or the first error encountered.
-    pub fn scan_tokens(mut self) -> Result<Vec<Token>, LoxError> {
+    /// `Eof`) or every error accumulated along the way.
+    pub fn scan_tokens(mut self) -> Result<Vec<Token>, Vec<LoxError>> {
         while !self.is_at_end() {
             self.start = self.current;
-            self.scan_token()?;
+            self.scan_token();
         }
         self.tokens
             .push(Token::new(TokenType::Eof, String::new(), None, self.line));
-        Ok(self.tokens)
+        if self.errors.is_empty() {
+            Ok(self.tokens)
+        } else {
+            Err(self.errors)
+        }
     }
 
-    fn scan_token(&mut self) -> Result<(), LoxError> {
+    /// Same as `scan_tokens`, but always returns both the token stream and the
+    /// accumulated errors so callers can continue parsing to surface follow-up
+    /// issues. Useful for the script runner which wants to mimic jlox's
+    /// multi-stage error dump.
+    pub fn scan_tokens_and_errors(mut self) -> (Vec<Token>, Vec<LoxError>) {
+        while !self.is_at_end() {
+            self.start = self.current;
+            self.scan_token();
+        }
+        self.tokens
+            .push(Token::new(TokenType::Eof, String::new(), None, self.line));
+        (self.tokens, self.errors)
+    }
+
+    fn scan_token(&mut self) {
         let c = self.advance();
         match c {
             b'(' => self.add_token(TokenType::LeftParen),
@@ -103,21 +124,17 @@ impl<'a> Scanner<'a> {
             }
             b' ' | b'\r' | b'\t' => {}
             b'\n' => self.line += 1,
-            b'"' => self.string()?,
+            b'"' => self.string(),
             b if is_digit(b) => self.number(),
             b if is_alpha(b) => self.identifier(),
-            other => {
-                return Err(LoxError::syntax(
-                    self.line,
-                    "",
-                    format!("Unexpected character '{}'.", other as char),
-                ));
+            _ => {
+                self.errors
+                    .push(LoxError::syntax(self.line, "", "Unexpected character."));
             }
         }
-        Ok(())
     }
 
-    fn string(&mut self) -> Result<(), LoxError> {
+    fn string(&mut self) {
         // Consume chars until the closing `"`. Multi-line allowed; newlines
         // increment `line`. No escape sequences per book.
         while !self.is_at_end() && self.peek() != b'"' {
@@ -128,7 +145,9 @@ impl<'a> Scanner<'a> {
         }
 
         if self.is_at_end() {
-            return Err(LoxError::syntax(self.line, "", "Unterminated string."));
+            self.errors
+                .push(LoxError::syntax(self.line, "", "Unterminated string."));
+            return;
         }
 
         // Consume the closing `"`.
@@ -138,7 +157,6 @@ impl<'a> Scanner<'a> {
         // because `"` is a single ASCII byte.
         let value = &self.source[self.start + 1..self.current - 1];
         self.add_token_with_literal(TokenType::String, Some(Literal::Str(value.to_string())));
-        Ok(())
     }
 
     fn number(&mut self) {
@@ -326,8 +344,9 @@ mod scanner_tests {
 
     #[test]
     fn scanner_unterminated_string_errors() {
-        let err = Scanner::new("\"abc").scan_tokens().unwrap_err();
-        let s = err.to_string();
+        let errs = Scanner::new("\"abc").scan_tokens().unwrap_err();
+        assert_eq!(errs.len(), 1);
+        let s = errs[0].to_string();
         assert!(s.contains("Unterminated"), "got: {s}");
         assert!(s.contains("[line 1]"), "got: {s}");
     }
@@ -365,10 +384,23 @@ mod scanner_tests {
 
     #[test]
     fn scanner_rejects_stray_char_with_line() {
-        let err = Scanner::new("@").scan_tokens().unwrap_err();
-        let s = err.to_string();
+        let errs = Scanner::new("@").scan_tokens().unwrap_err();
+        assert_eq!(errs.len(), 1);
+        let s = errs[0].to_string();
         assert!(s.contains("[line 1]"), "got: {s}");
-        assert!(s.contains("'@'"), "got: {s}");
+        assert!(s.contains("Unexpected character."), "got: {s}");
+    }
+
+    #[test]
+    fn scanner_accumulates_multiple_errors() {
+        // Two stray chars on the same line should produce two errors.
+        let errs = Scanner::new("@ #").scan_tokens().unwrap_err();
+        assert_eq!(errs.len(), 2, "got: {errs:?}");
+        for e in &errs {
+            let s = e.to_string();
+            assert!(s.contains("[line 1]"), "got: {s}");
+            assert!(s.contains("Unexpected character."), "got: {s}");
+        }
     }
 
     #[test]

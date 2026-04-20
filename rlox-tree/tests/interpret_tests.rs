@@ -37,7 +37,7 @@ impl Write for SharedBuf {
 fn run_capture(src: &str) -> Result<String, String> {
     let tokens = Scanner::new(src)
         .scan_tokens()
-        .map_err(|e| format!("SCAN: {e}"))?;
+        .map_err(|errs| format!("SCAN: {}", render(&errs)))?;
     let stmts = Parser::new(tokens)
         .parse()
         .map_err(|errs| format!("PARSE: {}", render(&errs)))?;

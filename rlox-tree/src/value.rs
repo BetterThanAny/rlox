@@ -109,7 +109,13 @@ impl fmt::Display for LoxValue {
                 }
             }
             LoxValue::Str(s) => write!(f, "{s}"),
-            LoxValue::Callable(c) => write!(f, "<fn {}>", c.name()),
+            LoxValue::Callable(c) => {
+                if c.is_native() {
+                    write!(f, "<native fn>")
+                } else {
+                    write!(f, "<fn {}>", c.name())
+                }
+            }
             LoxValue::Class(c) => write!(f, "{}", c.name),
             LoxValue::Instance(i) => write!(f, "{} instance", i.borrow().class.name),
         }
@@ -125,6 +131,11 @@ pub trait LoxCallable: fmt::Debug {
     fn arity(&self) -> usize;
     fn call(&self, executor: &mut dyn Executor, args: Vec<LoxValue>) -> Result<LoxValue, LoxError>;
     fn name(&self) -> &str;
+    /// `true` for host-provided built-ins like `clock`. User-defined
+    /// functions, methods, and classes should return `false` (the default).
+    fn is_native(&self) -> bool {
+        false
+    }
 }
 
 /// A host-provided built-in like `clock()`.
@@ -154,6 +165,10 @@ impl LoxCallable for NativeFn {
 
     fn name(&self) -> &str {
         self.name_
+    }
+
+    fn is_native(&self) -> bool {
+        true
     }
 }
 

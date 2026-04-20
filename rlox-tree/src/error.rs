@@ -3,10 +3,11 @@
 //! Three variants match the three pipeline stages where errors can originate:
 //! scanner/parser (`Syntax`), resolver (`Resolve`), and interpreter (`Runtime`).
 //!
-//! Display format follows *Crafting Interpreters* (Nystrom, ch. 4 & 7):
-//!   `[line N] Error<loc>: <msg>`
-//!   `[line N] RuntimeError: <msg>`
-//!   `[line N] ResolveError: <msg>`
+//! Display format follows *Crafting Interpreters* (Nystrom, ch. 4, 7, 13):
+//!   `[line N] Error<loc>: <msg>`   (compile-time — scanner/parser/resolver)
+//!   `<msg>\n[line N] in script`    (runtime — mimics clox stack-trace frame)
+//!   `[line N] ResolveError: <msg>` (resolve — retained for parity but unused
+//!                                   now that the resolver emits `Syntax`)
 //!
 //! The `loc` field on `Syntax` is expected to carry its own leading formatting
 //! (e.g. `" at '('"`, `" at end"`, or `""`) so the book's exact output is
@@ -23,7 +24,7 @@ pub enum LoxError {
         msg: String,
     },
 
-    #[error("[line {line}] RuntimeError: {msg}")]
+    #[error("{msg}\n[line {line}] in script")]
     Runtime { line: usize, msg: String },
 
     #[error("[line {line}] ResolveError: {msg}")]
@@ -79,7 +80,7 @@ mod error_tests {
     #[test]
     fn error_runtime_display() {
         let e = LoxError::runtime(5, "divide by zero");
-        assert_eq!(e.to_string(), "[line 5] RuntimeError: divide by zero");
+        assert_eq!(e.to_string(), "divide by zero\n[line 5] in script");
     }
 
     #[test]

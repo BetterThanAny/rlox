@@ -109,8 +109,9 @@ impl Resolver {
                 if let Some(sc) = superclass {
                     if let Expr::Variable { name: sc_name, .. } = sc {
                         if sc_name.lexeme == name.lexeme {
-                            self.errors.push(LoxError::resolve(
+                            self.errors.push(LoxError::syntax(
                                 sc_name.line,
+                                format!(" at '{}'", sc_name.lexeme),
                                 "A class can't inherit from itself.",
                             ));
                         }
@@ -168,15 +169,17 @@ impl Resolver {
             Stmt::Print(e) => self.resolve_expr(e),
             Stmt::Return { keyword, value } => {
                 if self.current_fn == FunctionType::None {
-                    self.errors.push(LoxError::resolve(
+                    self.errors.push(LoxError::syntax(
                         keyword.line,
+                        format!(" at '{}'", keyword.lexeme),
                         "Can't return from top-level code.",
                     ));
                 }
                 if let Some(v) = value {
                     if self.current_fn == FunctionType::Initializer {
-                        self.errors.push(LoxError::resolve(
+                        self.errors.push(LoxError::syntax(
                             keyword.line,
+                            format!(" at '{}'", keyword.lexeme),
                             "Can't return a value from an initializer.",
                         ));
                     }
@@ -195,8 +198,9 @@ impl Resolver {
             Expr::Variable { name, id } => {
                 if let Some(scope) = self.scopes.last() {
                     if scope.get(&name.lexeme) == Some(&false) {
-                        self.errors.push(LoxError::resolve(
+                        self.errors.push(LoxError::syntax(
                             name.line,
+                            format!(" at '{}'", name.lexeme),
                             "Can't read local variable in its own initializer.",
                         ));
                     }
@@ -232,13 +236,15 @@ impl Resolver {
             }
             Expr::Super { keyword, id, .. } => {
                 if self.current_class == ClassType::None {
-                    self.errors.push(LoxError::resolve(
+                    self.errors.push(LoxError::syntax(
                         keyword.line,
+                        format!(" at '{}'", keyword.lexeme),
                         "Can't use 'super' outside of a class.",
                     ));
                 } else if self.current_class == ClassType::Class {
-                    self.errors.push(LoxError::resolve(
+                    self.errors.push(LoxError::syntax(
                         keyword.line,
+                        format!(" at '{}'", keyword.lexeme),
                         "Can't use 'super' in a class with no superclass.",
                     ));
                 }
@@ -246,8 +252,9 @@ impl Resolver {
             }
             Expr::This { keyword, id } => {
                 if self.current_class == ClassType::None {
-                    self.errors.push(LoxError::resolve(
+                    self.errors.push(LoxError::syntax(
                         keyword.line,
+                        format!(" at '{}'", keyword.lexeme),
                         "Can't use 'this' outside of a class.",
                     ));
                     return;
@@ -274,8 +281,9 @@ impl Resolver {
             return;
         };
         if scope.contains_key(&name.lexeme) {
-            self.errors.push(LoxError::resolve(
+            self.errors.push(LoxError::syntax(
                 name.line,
+                format!(" at '{}'", name.lexeme),
                 "Already a variable with this name in this scope.",
             ));
         }

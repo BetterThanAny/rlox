@@ -56,11 +56,11 @@ mod parse_directives {
     /// * `// expect runtime error: <msg>` → `RuntimeError`.
     /// * `// [line N] Error <rest>` → explicit-line compile error.
     /// * `// [java line N] Error <rest>` → jlox-only compile error (keep;
-    ///    caller filters by target).
+    ///   caller filters by target).
     /// * `// [c line N] Error <rest>` → clox-only compile error (keep;
-    ///    caller filters by target).
+    ///   caller filters by target).
     /// * `// Error <rest>` or `// Error at '<x>': <msg>` → compile error on
-    ///    the line the comment appears on.
+    ///   the line the comment appears on.
     ///
     /// Lines that don't match any of the above are ignored.
     pub fn extract(source: &str) -> Vec<Expect> {
@@ -244,9 +244,7 @@ mod runner {
                     failures.push(format!("stdout[{i}]: expected {want:?} got {got:?}"));
                 }
                 None => {
-                    failures.push(format!(
-                        "stdout[{i}]: expected {want:?} but stdout ended"
-                    ));
+                    failures.push(format!("stdout[{i}]: expected {want:?} but stdout ended"));
                 }
             }
         }
@@ -449,11 +447,11 @@ fn filter_directives(
     target_kind: TargetKind,
 ) -> Vec<parse_directives::Expect> {
     raw.into_iter()
-        .filter(|(tag, _)| match (tag, target_kind) {
-            (None, _) => true,
-            (Some("java"), TargetKind::Tree) => true,
-            (Some("c"), TargetKind::Vm) => true,
-            _ => false,
+        .filter(|(tag, _)| {
+            matches!(
+                (tag, target_kind),
+                (None, _) | (Some("java"), TargetKind::Tree) | (Some("c"), TargetKind::Vm)
+            )
         })
         .map(|(_, exp)| exp)
         .collect()
@@ -584,13 +582,7 @@ fn bucket(map: &mut BTreeMap<String, (usize, usize)>, rel: &str, passed: bool) {
 
 fn print_summary(s: &Summary) {
     println!("{}:", s.label);
-    let dir_label_width = s
-        .per_dir
-        .keys()
-        .map(|k| k.len())
-        .max()
-        .unwrap_or(0)
-        .max(16);
+    let dir_label_width = s.per_dir.keys().map(|k| k.len()).max().unwrap_or(0).max(16);
     for (dir, (pass, total)) in &s.per_dir {
         println!(
             "  {:<width$}  {}/{}",
@@ -776,7 +768,8 @@ mod tests {
 
     #[test]
     fn directives_bare_error_uses_comment_line() {
-        let src = "{\n  class Foo < Foo {} // Error at 'Foo': A class can't inherit from itself.\n}\n";
+        let src =
+            "{\n  class Foo < Foo {} // Error at 'Foo': A class can't inherit from itself.\n}\n";
         let got = extract(src);
         assert_eq!(
             got,

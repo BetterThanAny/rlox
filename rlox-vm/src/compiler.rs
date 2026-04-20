@@ -274,27 +274,36 @@ impl<'src> Compiler<'src> {
 
     // ---------- error reporting ----------
 
-    fn error_at_current(&mut self, msg: &str, line: usize) {
+    /// Book-equivalent `errorAt`: emit an error tagged with `token`'s lexeme
+    /// context. `at end` for EOF, `at '<lex>'` for normal tokens, and an
+    /// unadorned `Error: <msg>` for scanner-produced `Error` tokens (whose
+    /// lexeme already is the error message itself).
+    fn error_at(&mut self, token_kind: TokenType, lexeme: &str, line: usize, msg: &str) {
         if self.parser.panic_mode {
             return;
         }
         self.parser.panic_mode = true;
         self.parser.had_error = true;
-        self.parser
-            .errors
-            .push(format!("[line {line}] Error: {msg}"));
+        let framed = match token_kind {
+            TokenType::Eof => format!("[line {line}] Error at end: {msg}"),
+            TokenType::Error => format!("[line {line}] Error: {msg}"),
+            _ => format!("[line {line}] Error at '{lexeme}': {msg}"),
+        };
+        self.parser.errors.push(framed);
+    }
+
+    fn error_at_current(&mut self, msg: &str, _line: usize) {
+        let tt = self.parser.current.ttype;
+        let lex = self.parser.current.lexeme.clone();
+        let line = self.parser.current.line;
+        self.error_at(tt, &lex, line, msg);
     }
 
     fn error(&mut self, msg: &str) {
+        let tt = self.parser.previous.ttype;
+        let lex = self.parser.previous.lexeme.clone();
         let line = self.parser.previous.line;
-        if self.parser.panic_mode {
-            return;
-        }
-        self.parser.panic_mode = true;
-        self.parser.had_error = true;
-        self.parser
-            .errors
-            .push(format!("[line {line}] Error: {msg}"));
+        self.error_at(tt, &lex, line, msg);
     }
 
     // ---------- emit helpers ----------

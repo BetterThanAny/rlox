@@ -105,12 +105,21 @@ fn run_prompt() -> Result<()> {
 /// (globals, local side-table) persists across calls, which is what the REPL
 /// wants.
 fn run(interp: &mut Interpreter, src: &str) -> std::result::Result<(), RunError> {
-    let tokens = Scanner::new(src)
-        .scan_tokens()
-        .map_err(|e| RunError::Syntax(vec![e]))?;
-
-    let mut parser = Parser::new(tokens);
-    let stmts = parser.parse().map_err(RunError::Syntax)?;
+    // Scan even on failure so the parser can still report follow-up errors
+    // (jlox-style: compiler halts only once every stage has emitted its
+    // errors). We merge scan + parse errors into a single `Syntax` payload.
+    let (tokens, scan_errors) = Scanner::new(src).scan_tokens_and_errors();
+    let parse_result = Parser::new(tokens).parse();
+    let stmts = match (scan_errors.is_empty(), parse_result) {
+        (true, Ok(s)) => s,
+        (true, Err(errs)) => return Err(RunError::Syntax(errs)),
+        (false, Ok(_)) => return Err(RunError::Syntax(scan_errors)),
+        (false, Err(mut parse_errs)) => {
+            let mut all = scan_errors;
+            all.append(&mut parse_errs);
+            return Err(RunError::Syntax(all));
+        }
+    };
 
     let locals = Resolver::new().resolve(&stmts).map_err(RunError::Resolve)?;
     interp.install_locals(locals);
