@@ -1,0 +1,13 @@
+fun makeCounter() {
+  var n = 0;
+  fun counter() {
+    n = n + 1;
+    return n;
+  }
+  return counter;
+}
+
+var c = makeCounter();
+print c(); // expect: 1
+print c(); // expect: 2
+print c(); // expect: 3

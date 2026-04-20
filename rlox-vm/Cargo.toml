@@ -1,0 +1,22 @@
+[package]
+name = "rlox-vm"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "rlox_vm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rlox-vm"
+path = "src/main.rs"
+
+[features]
+default = []
+gc_stress = []
+
+[dependencies]
+thiserror.workspace = true
+anyhow.workspace = true
+rustyline.workspace = true

@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["rlox-tree", "rlox-vm", "test-suite"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.75"
+
+[workspace.dependencies]
+thiserror = "1"
+anyhow = "1"
+rustyline = "14"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
