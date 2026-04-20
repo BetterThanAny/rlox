@@ -104,8 +104,18 @@ pub struct Token {
 }
 
 impl Token {
-    pub fn new(ttype: TokenType, lexeme: impl Into<String>, literal: Option<Literal>, line: usize) -> Self {
-        Self { ttype, lexeme: lexeme.into(), literal, line }
+    pub fn new(
+        ttype: TokenType,
+        lexeme: impl Into<String>,
+        literal: Option<Literal>,
+        line: usize,
+    ) -> Self {
+        Self {
+            ttype,
+            lexeme: lexeme.into(),
+            literal,
+            line,
+        }
     }
 }
 
@@ -144,8 +154,8 @@ mod token_tests {
 
     #[test]
     fn literal_number_fractional_preserved() {
-        let n = Literal::Num(3.14);
-        assert_eq!(format!("{n}"), "3.14");
+        let n = Literal::Num(2.5);
+        assert_eq!(format!("{n}"), "2.5");
     }
 
     #[test]
