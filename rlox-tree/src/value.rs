@@ -4,12 +4,13 @@
 //! hierarchy (Crafting Interpreters, chs. 7, 10, 12, 13) as a Rust enum plus
 //! trait-object callables.
 //!
-//! This file is written to compile *standalone* in Wave 2 — the concrete
-//! `Environment` type lands in Wave 3 and the concrete `Interpreter` in Wave 4.
-//! To keep `value.rs` decoupled, the bridge to the rest of the interpreter is
-//! the trait pair [`Executor`] + [`EnvironmentLike`]: the interpreter
-//! implements `Executor`, the environment implements `EnvironmentLike`, and
-//! `LoxFunction` / `LoxClass` talk to them only through `dyn` objects.
+//! The bridge to the interpreter is the [`Executor`] trait: `LoxFunction` and
+//! `LoxClass` cannot own the concrete `Interpreter` directly (which owns them
+//! via `Rc<dyn LoxCallable>`), so they call back through `&mut dyn Executor`
+//! when they need to execute a function body. `LoxFunction::closure` is stored
+//! as a concrete `Rc<RefCell<Environment>>` — cross-module cycle between
+//! `value.rs` and `environment.rs` is resolved at the `use` layer and is fine
+//! for rustc.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -18,34 +19,35 @@ use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ast::Stmt;
+use crate::environment::Environment;
 use crate::error::LoxError;
 use crate::token::{Literal, Token};
 
 // ---------------------------------------------------------------------------
-// Forward-compatible bridge traits.
+// Bridge traits.
 // ---------------------------------------------------------------------------
 
 /// Interface the interpreter must provide so `LoxFunction` / `LoxClass` can
 /// execute their bodies without knowing the concrete `Interpreter` type.
 ///
-/// Wave 4 will `impl Executor for Interpreter`.
+/// `Interpreter` implements this in `interpreter.rs`.
 pub trait Executor {
-    /// Execute a block of statements in the supplied environment.
-    fn execute_block_with(
+    /// Run a function body inside the given environment. Returns the return
+    /// value produced by a `return` statement, or `Nil` if the body ran to
+    /// completion. The implementation catches the function-level return sentinel
+    /// and converts it back to a plain `Result<LoxValue, LoxError>`.
+    fn execute_function_body(
         &mut self,
-        stmts: &[Stmt],
-        environment_rc: Rc<RefCell<dyn EnvironmentLike>>,
-    ) -> Result<(), LoxError>;
-
-    /// Access the interpreter's globals environment (handy for native fns).
-    fn globals(&self) -> Rc<RefCell<dyn EnvironmentLike>>;
+        body: &[Stmt],
+        env: Rc<RefCell<Environment>>,
+    ) -> Result<LoxValue, LoxError>;
 }
 
-/// Thin trait capturing the minimum operations `LoxFunction` needs on an
-/// environment. Wave 3's concrete `Environment` will implement this.
-///
-/// `Debug` is a supertrait so `LoxFunction` (which holds a
-/// `Rc<RefCell<dyn EnvironmentLike>>`) can still derive `Debug`.
+/// Thin trait historically used to decouple `value.rs` from `environment.rs`.
+/// The concrete `Environment` type now flows directly into `LoxFunction`, but
+/// the trait is retained because `environment.rs` (which this task may not
+/// modify) still `impl`s it, and dropping it here would break that file's
+/// tests.
 pub trait EnvironmentLike: fmt::Debug {
     /// Define (or redefine) a variable in the current scope.
     fn define(&mut self, name: String, value: LoxValue);
@@ -189,8 +191,25 @@ pub fn native_clock() -> LoxValue {
 #[derive(Debug)]
 pub struct LoxFunction {
     pub decl: Stmt,
-    pub closure: Rc<RefCell<dyn EnvironmentLike>>,
+    pub closure: Rc<RefCell<Environment>>,
     pub is_initializer: bool,
+}
+
+impl LoxFunction {
+    /// Book ch. 12 `LoxFunction.bind(instance)`: return a new LoxFunction whose
+    /// closure is a child of the original closure with `this` defined.
+    pub fn bind(&self, instance: Rc<RefCell<LoxInstance>>) -> LoxFunction {
+        let env = Rc::new(RefCell::new(Environment::with_enclosing(Rc::clone(
+            &self.closure,
+        ))));
+        env.borrow_mut()
+            .define("this", LoxValue::Instance(instance));
+        LoxFunction {
+            decl: self.decl.clone(),
+            closure: env,
+            is_initializer: self.is_initializer,
+        }
+    }
 }
 
 impl LoxCallable for LoxFunction {
@@ -201,18 +220,34 @@ impl LoxCallable for LoxFunction {
         }
     }
 
-    // TODO(M3): wire to Interpreter via Executor trait.
-    // The real implementation builds a fresh environment enclosing
-    // `self.closure`, defines each parameter, calls
-    // `executor.execute_block_with(body, env)`, unwinds a `Return` sentinel,
-    // and (for `is_initializer`) rebinds `this`. Deferred to Wave 4 so this
-    // file compiles without a concrete Environment / Interpreter.
-    fn call(
-        &self,
-        _executor: &mut dyn Executor,
-        _args: Vec<LoxValue>,
-    ) -> Result<LoxValue, LoxError> {
-        unimplemented!("LoxFunction::call wired to Interpreter in Wave 4")
+    fn call(&self, executor: &mut dyn Executor, args: Vec<LoxValue>) -> Result<LoxValue, LoxError> {
+        let Stmt::Function { params, body, .. } = &self.decl else {
+            unreachable!("LoxFunction::decl must be Stmt::Function");
+        };
+
+        // Build the call-frame env: a fresh child of the closure, with each
+        // parameter defined to its corresponding argument.
+        let env = Rc::new(RefCell::new(Environment::with_enclosing(Rc::clone(
+            &self.closure,
+        ))));
+        {
+            let mut env_mut = env.borrow_mut();
+            for (param, arg) in params.iter().zip(args.into_iter()) {
+                env_mut.define(param.lexeme.clone(), arg);
+            }
+        }
+
+        let result = executor.execute_function_body(body, env)?;
+
+        // Book ch. 12.6: init() always returns `this`, even on explicit bare
+        // `return;`. The function's closure includes a `this` binding (see
+        // `bind` above), so fetch it out of the closure at depth 0.
+        if self.is_initializer {
+            if let Some(this) = self.closure.borrow().get_at(0, "this") {
+                return Ok(this);
+            }
+        }
+        Ok(result)
     }
 
     fn name(&self) -> &str {
@@ -246,27 +281,35 @@ impl LoxClass {
         }
         None
     }
-}
 
-impl LoxCallable for LoxClass {
-    fn arity(&self) -> usize {
+    /// Arity of the class's `init` method, or 0 if none.
+    pub fn arity(&self) -> usize {
         self.find_method("init").map(|i| i.arity()).unwrap_or(0)
     }
+}
 
-    // TODO(M3): wire to Interpreter via Executor trait.
-    // Real implementation allocates a `LoxInstance`, binds `init` if present
-    // with the fresh instance as `this`, invokes it, and returns the instance.
-    fn call(
-        &self,
-        _executor: &mut dyn Executor,
-        _args: Vec<LoxValue>,
-    ) -> Result<LoxValue, LoxError> {
-        unimplemented!("LoxClass::call wired to Interpreter in Wave 4")
+/// Invoke a class as a constructor. Takes an owned `Rc<LoxClass>` so the
+/// resulting `LoxInstance` points at the exact same class value stored in the
+/// interpreter's environment (preserving pointer identity for class `==`).
+///
+/// The `LoxCallable` trait only surfaces `&self`, so classes are **not**
+/// called through it — the interpreter dispatches on `LoxValue::Class`
+/// directly and invokes this helper.
+pub fn instantiate_class(
+    class: Rc<LoxClass>,
+    executor: &mut dyn Executor,
+    args: Vec<LoxValue>,
+) -> Result<LoxValue, LoxError> {
+    let instance = Rc::new(RefCell::new(LoxInstance {
+        class: Rc::clone(&class),
+        fields: HashMap::new(),
+    }));
+    if let Some(initializer) = class.find_method("init") {
+        initializer
+            .bind(Rc::clone(&instance))
+            .call(executor, args)?;
     }
-
-    fn name(&self) -> &str {
-        &self.name
-    }
+    Ok(LoxValue::Instance(instance))
 }
 
 // ---------------------------------------------------------------------------
@@ -281,28 +324,35 @@ pub struct LoxInstance {
 }
 
 impl LoxInstance {
-    /// `instance.name` lookup: check fields first, then class methods.
-    ///
-    /// Method binding (threading `this` into the closure) is performed by the
-    /// interpreter in Wave 4; here we merely surface the raw callable so
-    /// tests can observe that methods are reachable.
-    pub fn get(&self, name: &Token) -> Result<LoxValue, LoxError> {
-        if let Some(v) = self.fields.get(&name.lexeme) {
-            return Ok(v.clone());
-        }
-        if let Some(method) = self.class.find_method(&name.lexeme) {
-            return Ok(LoxValue::Callable(method));
-        }
-        Err(LoxError::runtime(
-            name.line,
-            format!("Undefined property '{}'.", name.lexeme),
-        ))
-    }
-
     /// `instance.name = value`.
     pub fn set(&mut self, name: &Token, value: LoxValue) {
         self.fields.insert(name.lexeme.clone(), value);
     }
+}
+
+/// `instance.name` lookup: check fields first, then (bound) class methods.
+///
+/// This lives outside the `LoxInstance` impl because method binding needs
+/// `Rc<RefCell<LoxInstance>>` (not `&LoxInstance`) to thread `this` into the
+/// method's closure.
+pub fn instance_get(
+    instance: &Rc<RefCell<LoxInstance>>,
+    name: &Token,
+) -> Result<LoxValue, LoxError> {
+    let borrow = instance.borrow();
+    if let Some(v) = borrow.fields.get(&name.lexeme) {
+        return Ok(v.clone());
+    }
+    if let Some(method) = borrow.class.find_method(&name.lexeme) {
+        // Bind `this` into a fresh closure and surface as a Callable.
+        drop(borrow);
+        let bound = method.bind(Rc::clone(instance));
+        return Ok(LoxValue::Callable(Rc::new(bound)));
+    }
+    Err(LoxError::runtime(
+        name.line,
+        format!("Undefined property '{}'.", name.lexeme),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -413,20 +463,14 @@ mod value_tests {
 
     #[test]
     fn value_lox_class_find_method_searches_superclass() {
-        // Build a tiny `foo` method shell. We never call it, so we don't
-        // need a real closure — just a Stmt::Function to satisfy the type.
+        // Build a tiny `foo` method shell. We never call it, so a real but
+        // empty Environment is fine as the closure.
         let foo_decl = Stmt::Function {
             name: ident("foo"),
             params: vec![],
             body: vec![],
         };
-        // A dummy EnvironmentLike impl just so we can construct the closure Rc.
-        #[derive(Debug)]
-        struct DummyEnv;
-        impl EnvironmentLike for DummyEnv {
-            fn define(&mut self, _name: String, _value: LoxValue) {}
-        }
-        let closure: Rc<RefCell<dyn EnvironmentLike>> = Rc::new(RefCell::new(DummyEnv));
+        let closure = Rc::new(RefCell::new(Environment::new()));
         let foo_fn = Rc::new(LoxFunction {
             decl: foo_decl,
             closure,
@@ -462,13 +506,13 @@ mod value_tests {
             superclass: None,
             methods: HashMap::new(),
         });
-        let mut inst = LoxInstance {
+        let inst = Rc::new(RefCell::new(LoxInstance {
             class,
             fields: HashMap::new(),
-        };
+        }));
         let x = ident("x");
-        inst.set(&x, LoxValue::Number(1.0));
-        match inst.get(&x).expect("field set above") {
+        inst.borrow_mut().set(&x, LoxValue::Number(1.0));
+        match instance_get(&inst, &x).expect("field set above") {
             LoxValue::Number(n) => assert_eq!(n, 1.0),
             _ => panic!("expected Number(1)"),
         }
@@ -481,12 +525,12 @@ mod value_tests {
             superclass: None,
             methods: HashMap::new(),
         });
-        let inst = LoxInstance {
+        let inst = Rc::new(RefCell::new(LoxInstance {
             class,
             fields: HashMap::new(),
-        };
+        }));
         let name = Token::new(TokenType::Identifier, "missing", None, 4);
-        let err = inst.get(&name).expect_err("should be undefined");
+        let err = instance_get(&inst, &name).expect_err("should be undefined");
         match err {
             LoxError::Runtime { line, msg } => {
                 assert_eq!(line, 4);
