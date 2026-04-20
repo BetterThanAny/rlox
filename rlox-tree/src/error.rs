@@ -1,13 +1,10 @@
 //! Shared error type for the rlox tree-walking interpreter.
 //!
-//! Three variants match the three pipeline stages where errors can originate:
-//! scanner/parser (`Syntax`), resolver (`Resolve`), and interpreter (`Runtime`).
-//!
+//! Two variants match the two pipeline stages where errors originate as of
+//! M8: compile-time (scanner/parser/resolver) and runtime (interpreter).
 //! Display format follows *Crafting Interpreters* (Nystrom, ch. 4, 7, 13):
-//!   `[line N] Error<loc>: <msg>`   (compile-time — scanner/parser/resolver)
-//!   `<msg>\n[line N] in script`    (runtime — mimics clox stack-trace frame)
-//!   `[line N] ResolveError: <msg>` (resolve — retained for parity but unused
-//!                                   now that the resolver emits `Syntax`)
+//!   `[line N] Error<loc>: <msg>`   (compile-time)
+//!   `<msg>\n[line N] in script`    (runtime — mimics clox single-frame trace)
 //!
 //! The `loc` field on `Syntax` is expected to carry its own leading formatting
 //! (e.g. `" at '('"`, `" at end"`, or `""`) so the book's exact output is
@@ -26,9 +23,6 @@ pub enum LoxError {
 
     #[error("{msg}\n[line {line}] in script")]
     Runtime { line: usize, msg: String },
-
-    #[error("[line {line}] ResolveError: {msg}")]
-    Resolve { line: usize, msg: String },
 }
 
 impl LoxError {
@@ -42,13 +36,6 @@ impl LoxError {
 
     pub fn runtime(line: usize, msg: impl Into<String>) -> Self {
         Self::Runtime {
-            line,
-            msg: msg.into(),
-        }
-    }
-
-    pub fn resolve(line: usize, msg: impl Into<String>) -> Self {
-        Self::Resolve {
             line,
             msg: msg.into(),
         }
@@ -84,15 +71,6 @@ mod error_tests {
     }
 
     #[test]
-    fn error_resolve_display() {
-        let e = LoxError::resolve(2, "undefined variable 'x'");
-        assert_eq!(
-            e.to_string(),
-            "[line 2] ResolveError: undefined variable 'x'"
-        );
-    }
-
-    #[test]
     fn error_clone_and_eq() {
         let a = LoxError::syntax(7, " at 'foo'", "unexpected token");
         let b = a.clone();
@@ -103,7 +81,7 @@ mod error_tests {
         assert_eq!(r1, r2);
         assert_eq!(r1, r1.clone());
 
-        // Sanity: different variants are not equal.
-        assert_ne!(LoxError::runtime(1, "x"), LoxError::resolve(1, "x"));
+        // Sanity: Syntax vs Runtime are not equal.
+        assert_ne!(LoxError::runtime(1, "x"), LoxError::syntax(1, "", "x"));
     }
 }

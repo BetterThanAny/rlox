@@ -182,8 +182,12 @@ Work is dispatched in **three waves**, each preceded by a serial scaffolding ste
 
 ## 7. Testing strategy
 
-- **Unit tests:** colocated in each module via `#[cfg(test)]` where the logic is small; otherwise in `crate/tests/*.rs`.
-- **Integration tests per crate:** `tests/interpret_tests.rs` runs embedded `.lox` strings through the full pipeline.
+- **Unit tests:** colocated in each module via `#[cfg(test)]`. This is the
+  chosen shape across the whole workspace — the `tests/<module>_tests.rs`
+  files listed in §3.1 are descriptive of test *intent*, not physical layout.
+- **Integration tests per crate:** `rlox-tree/tests/interpret_tests.rs` and
+  `rlox-vm/tests/vm_tests.rs` run embedded `.lox` strings through the full
+  pipeline.
 - **End-to-end test suite:** `test-suite` crate runs vendored Lox scripts, diffs stdout against `// expect: <line>` comments in source (exact book convention).
 - **GC stress:** `cargo test -p rlox-vm --features gc_stress`.
 - **Lint:** `cargo fmt --check` + `cargo clippy --workspace --all-targets -- -D warnings`.

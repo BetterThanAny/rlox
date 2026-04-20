@@ -49,7 +49,9 @@ mod parse_directives {
     }
 
     /// Scan the source for directive comments and return them in source order.
-    #[allow(dead_code)] // required public API per milestone spec; used in tests.
+    ///
+    /// This is the untagged convenience form used by inline tests; production
+    /// code calls [`extract_tagged`] directly so it can filter by target.
     ///
     /// Rules implemented:
     /// * `// expect: <text>` → `Stdout`.
@@ -63,6 +65,7 @@ mod parse_directives {
     ///   the line the comment appears on.
     ///
     /// Lines that don't match any of the above are ignored.
+    #[cfg(test)]
     pub fn extract(source: &str) -> Vec<Expect> {
         extract_tagged(source)
             .into_iter()

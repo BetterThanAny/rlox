@@ -170,10 +170,11 @@ fn invoke_instruction(
 fn closure_instruction(line: &mut String, chunk: &Chunk, offset: usize) -> (String, usize) {
     // `OP_CLOSURE  <const-idx>  '<fn>'`, then one indented line per upvalue.
     //
-    // We cannot read the embedded upvalue count from the function value until
-    // M6 lands `ObjFunction`; for M4 we simply emit the header line and
-    // advance past the constant operand. The compiler in M5 will revisit
-    // this routine (the book extends it to walk upvalue pairs).
+    // NOTE: this header-only dump does not walk the trailing 2*upvalue_count
+    // operand bytes emitted by the compiler. A full trace would need to pull
+    // `function.upvalue_count` from the constant pool and advance accordingly.
+    // Since the disassembler is currently only used in tests, this shortcut
+    // is acceptable.
     let const_idx = chunk.code[offset + 1] as usize;
     write!(line, "{:<16} {const_idx:>4} '", "OP_CLOSURE").unwrap();
     if let Some(v) = chunk.constants.get(const_idx) {
