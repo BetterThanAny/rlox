@@ -105,13 +105,9 @@ fn run_prompt() -> Result<()> {
 /// (globals, local side-table) persists across calls, which is what the REPL
 /// wants.
 fn run(interp: &mut Interpreter, src: &str) -> std::result::Result<(), RunError> {
-    // Scanner returns `Result<_, String>`; the string is of the form
-    // `[line N] Error: ...`. Extract the line; fall back to 0.
-    let tokens = Scanner::new(src).scan_tokens().map_err(|msg| {
-        let line = parse_line_prefix(&msg).unwrap_or(0);
-        let stripped = strip_line_prefix(&msg);
-        RunError::Syntax(vec![LoxError::syntax(line, "", stripped)])
-    })?;
+    let tokens = Scanner::new(src)
+        .scan_tokens()
+        .map_err(|e| RunError::Syntax(vec![e]))?;
 
     let mut parser = Parser::new(tokens);
     let stmts = parser.parse().map_err(RunError::Syntax)?;
@@ -120,25 +116,4 @@ fn run(interp: &mut Interpreter, src: &str) -> std::result::Result<(), RunError>
     interp.install_locals(locals);
 
     interp.interpret(&stmts).map_err(RunError::Runtime)
-}
-
-/// Extract the `N` from a `"[line N] ..."` prefix, if present.
-fn parse_line_prefix(s: &str) -> Option<usize> {
-    let rest = s.strip_prefix("[line ")?;
-    let end = rest.find(']')?;
-    rest[..end].parse().ok()
-}
-
-/// Strip the `"[line N] Error: "` prefix from a scanner error message so the
-/// rewrapped `LoxError::Syntax` doesn't double up the framing when it prints.
-fn strip_line_prefix(s: &str) -> String {
-    if let Some(rest) = s.strip_prefix("[line ") {
-        if let Some(end) = rest.find("] ") {
-            let after = &rest[end + 2..];
-            // Book scanner emits `Error: ...`; drop the leading tag too.
-            let after = after.strip_prefix("Error: ").unwrap_or(after);
-            return after.to_string();
-        }
-    }
-    s.to_string()
 }

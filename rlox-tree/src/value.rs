@@ -43,16 +43,6 @@ pub trait Executor {
     ) -> Result<LoxValue, LoxError>;
 }
 
-/// Thin trait historically used to decouple `value.rs` from `environment.rs`.
-/// The concrete `Environment` type now flows directly into `LoxFunction`, but
-/// the trait is retained because `environment.rs` (which this task may not
-/// modify) still `impl`s it, and dropping it here would break that file's
-/// tests.
-pub trait EnvironmentLike: fmt::Debug {
-    /// Define (or redefine) a variable in the current scope.
-    fn define(&mut self, name: String, value: LoxValue);
-}
-
 // ---------------------------------------------------------------------------
 // LoxValue.
 // ---------------------------------------------------------------------------

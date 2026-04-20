@@ -12,7 +12,7 @@ use std::rc::Rc;
 
 use crate::error::LoxError;
 use crate::token::Token;
-use crate::value::{EnvironmentLike, LoxValue};
+use crate::value::LoxValue;
 
 #[derive(Debug, Default)]
 pub struct Environment {
@@ -123,14 +123,6 @@ impl Environment {
         } else {
             false
         }
-    }
-}
-
-/// Bridge impl so `LoxFunction` (defined in `value.rs`) can define parameters
-/// into an `Environment` through a `dyn EnvironmentLike`.
-impl EnvironmentLike for Environment {
-    fn define(&mut self, name: String, value: LoxValue) {
-        self.values.insert(name, value);
     }
 }
 
@@ -317,22 +309,5 @@ mod environment_tests {
         assert!(!child.assign_at(0, "missing", LoxValue::Nil));
         // Miss: over-shoot returns false.
         assert!(!child.assign_at(9, "g", LoxValue::Nil));
-    }
-
-    #[test]
-    fn environment_environmentlike_define_bridges_to_inherent() {
-        // Verify the EnvironmentLike impl writes into the same map as
-        // the inherent `define` method.
-        let mut env = Environment::new();
-        // Call through the trait to be sure we're exercising that path.
-        <Environment as EnvironmentLike>::define(
-            &mut env,
-            "bridged".to_string(),
-            LoxValue::Bool(true),
-        );
-        match env.get(&ident("bridged")).unwrap() {
-            LoxValue::Bool(b) => assert!(b),
-            _ => panic!("expected Bool(true)"),
-        }
     }
 }

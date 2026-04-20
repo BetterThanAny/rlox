@@ -3,8 +3,10 @@
 //! The scanner consumes a source string and produces a `Vec<Token>` terminated
 //! by a single `TokenType::Eof` token. It tracks line numbers, supports
 //! multi-line strings (without escapes, per the book), and reports the first
-//! syntactic error as a human-readable `String` with a `[line N]` prefix.
+//! syntactic error as a `LoxError::Syntax` (matching the error convention
+//! used by the parser, resolver, and interpreter stages).
 
+use crate::error::LoxError;
 use crate::token::{Literal, Token, TokenType};
 
 /// Stateful scanner over a borrowed source buffer.
@@ -34,7 +36,7 @@ impl<'a> Scanner<'a> {
 
     /// Scan the entire source, returning either the produced tokens (ending in
     /// `Eof`) or the first error encountered.
-    pub fn scan_tokens(mut self) -> Result<Vec<Token>, String> {
+    pub fn scan_tokens(mut self) -> Result<Vec<Token>, LoxError> {
         while !self.is_at_end() {
             self.start = self.current;
             self.scan_token()?;
@@ -44,7 +46,7 @@ impl<'a> Scanner<'a> {
         Ok(self.tokens)
     }
 
-    fn scan_token(&mut self) -> Result<(), String> {
+    fn scan_token(&mut self) -> Result<(), LoxError> {
         let c = self.advance();
         match c {
             b'(' => self.add_token(TokenType::LeftParen),
@@ -105,16 +107,17 @@ impl<'a> Scanner<'a> {
             b if is_digit(b) => self.number(),
             b if is_alpha(b) => self.identifier(),
             other => {
-                return Err(format!(
-                    "[line {}] Error: Unexpected character '{}'.",
-                    self.line, other as char
+                return Err(LoxError::syntax(
+                    self.line,
+                    "",
+                    format!("Unexpected character '{}'.", other as char),
                 ));
             }
         }
         Ok(())
     }
 
-    fn string(&mut self) -> Result<(), String> {
+    fn string(&mut self) -> Result<(), LoxError> {
         // Consume chars until the closing `"`. Multi-line allowed; newlines
         // increment `line`. No escape sequences per book.
         while !self.is_at_end() && self.peek() != b'"' {
@@ -125,7 +128,7 @@ impl<'a> Scanner<'a> {
         }
 
         if self.is_at_end() {
-            return Err(format!("[line {}] Error: Unterminated string.", self.line));
+            return Err(LoxError::syntax(self.line, "", "Unterminated string."));
         }
 
         // Consume the closing `"`.
@@ -324,8 +327,9 @@ mod scanner_tests {
     #[test]
     fn scanner_unterminated_string_errors() {
         let err = Scanner::new("\"abc").scan_tokens().unwrap_err();
-        assert!(err.contains("Unterminated"), "got: {err}");
-        assert!(err.contains("[line 1]"), "got: {err}");
+        let s = err.to_string();
+        assert!(s.contains("Unterminated"), "got: {s}");
+        assert!(s.contains("[line 1]"), "got: {s}");
     }
 
     #[test]
@@ -362,8 +366,9 @@ mod scanner_tests {
     #[test]
     fn scanner_rejects_stray_char_with_line() {
         let err = Scanner::new("@").scan_tokens().unwrap_err();
-        assert!(err.contains("[line 1]"), "got: {err}");
-        assert!(err.contains("'@'"), "got: {err}");
+        let s = err.to_string();
+        assert!(s.contains("[line 1]"), "got: {s}");
+        assert!(s.contains("'@'"), "got: {s}");
     }
 
     #[test]

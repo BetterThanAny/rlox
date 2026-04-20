@@ -1,5 +1,7 @@
 //! Bytecode-compiling Lox VM (book's clox equivalent).
 
 pub mod chunk;
+pub mod compiler;
 pub mod debug;
+pub mod scanner;
 pub mod value;
