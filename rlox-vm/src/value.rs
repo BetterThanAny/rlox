@@ -1,12 +1,17 @@
 //! Runtime values. M5 adds `Str(Rc<String>)` and `Function(Rc<ObjFunction>)`
-//! / `Closure(Rc<Closure>)` variants alongside the M4 scalars.
+//! / `Closure(Rc<Closure>)` variants alongside the M4 scalars. M6 part A adds
+//! `Class`, `Instance`, `BoundMethod` wrapped in `Rc` so methods and instance
+//! fields can share ownership without a dedicated heap walk.
 //!
-//! Tradeoff: we defer a proper heap-managed `Obj` tree + GC to M6. For M5,
-//! shared ownership via `Rc` is sufficient — the only cycle risk is
-//! closure-captures-self, which `Crafting Interpreters` chapter 25 also dodges
-//! (the GC's sole job there is reclaiming unreachable closures; we simply leak
-//! them until M6 lands mark-sweep).
+//! Tradeoff: we defer a proper heap-managed `Obj` tree + GC to M6 part B. For
+//! now, shared ownership via `Rc` is sufficient — the only cycle risk is
+//! closure-captures-self and instance-references-bound-method-back-to-self,
+//! which `Crafting Interpreters` chapter 25 also dodges (the GC's sole job
+//! there is reclaiming unreachable closures; we simply leak them until the
+//! mark-sweep refactor lands).
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
 
@@ -67,6 +72,65 @@ impl Closure {
 /// Native function pointer. Signature matches book chapter 24 natives.
 pub type NativeFn = fn(&[Value]) -> Value;
 
+/// Runtime class object. Holds the method table — book chapter 27/28 keeps
+/// methods in a hash keyed by name; inheritance copies the parent's methods
+/// at `OP_INHERIT` time so resolution never walks the chain.
+///
+/// M6-GC: replaces `Rc` with GC-managed raw ptr.
+#[derive(Debug)]
+pub struct ObjClass {
+    pub name: Rc<String>,
+    /// Method table: method name → `Closure` (methods are closures with
+    /// `this` pre-wired into slot 0 of their locals).
+    pub methods: RefCell<HashMap<Rc<String>, Rc<Closure>>>,
+}
+
+impl ObjClass {
+    pub fn new(name: Rc<String>) -> Self {
+        Self {
+            name,
+            methods: RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// Look up a method by name. Because `OP_INHERIT` copies the parent's
+    /// methods into the child, this never has to walk a chain — a single
+    /// hash-map probe suffices.
+    pub fn find_method(&self, name: &Rc<String>) -> Option<Rc<Closure>> {
+        self.methods.borrow().get(name).cloned()
+    }
+}
+
+/// Runtime instance of a class. Field storage is per-instance.
+///
+/// M6-GC: replaces `Rc` with GC-managed raw ptr.
+#[derive(Debug)]
+pub struct ObjInstance {
+    pub class: Rc<ObjClass>,
+    pub fields: RefCell<HashMap<Rc<String>, Value>>,
+}
+
+impl ObjInstance {
+    pub fn new(class: Rc<ObjClass>) -> Self {
+        Self {
+            class,
+            fields: RefCell::new(HashMap::new()),
+        }
+    }
+}
+
+/// A method retrieved off an instance via `instance.method`. Stores the
+/// receiver alongside the closure so a later `OP_CALL` slides the receiver
+/// into slot 0 before invoking the method's body.
+///
+/// M6-GC: replaces `Rc` with GC-managed raw ptr.
+#[derive(Debug)]
+pub struct ObjBoundMethod {
+    /// The instance value (always a `Value::Instance`).
+    pub receiver: Value,
+    pub method: Rc<Closure>,
+}
+
 /// Lox runtime value.
 #[derive(Debug, Clone)]
 pub enum Value {
@@ -82,17 +146,24 @@ pub enum Value {
     Closure(Rc<Closure>),
     /// Native callable.
     Native(NativeFn),
+    /// Class object — callable to allocate an instance.
+    Class(Rc<ObjClass>),
+    /// Live instance of a class.
+    Instance(Rc<ObjInstance>),
+    /// Method bound to a receiver. Callable like a closure.
+    BoundMethod(Rc<ObjBoundMethod>),
 }
 
 impl Value {
-    /// Lox truthiness rule: only `nil` and `false` are falsey.
+    /// Lox truthiness rule: only `nil` and `false` are falsey. Classes,
+    /// instances, and bound methods are all truthy.
     pub fn is_falsey(&self) -> bool {
         matches!(self, Value::Nil | Value::Bool(false))
     }
 
     /// Book's `valuesEqual`. Strings compare by content (cheap via `Rc` fast
-    /// path). Functions / closures / natives compare by `Rc` identity —
-    /// matches clox pointer equality.
+    /// path). Functions / closures / natives / classes / instances / bound
+    /// methods compare by `Rc` identity — matches clox pointer equality.
     pub fn equals(&self, other: &Value) -> bool {
         match (self, other) {
             (Value::Nil, Value::Nil) => true,
@@ -102,6 +173,9 @@ impl Value {
             (Value::Function(a), Value::Function(b)) => Rc::ptr_eq(a, b),
             (Value::Closure(a), Value::Closure(b)) => Rc::ptr_eq(a, b),
             (Value::Native(a), Value::Native(b)) => (*a as usize) == (*b as usize),
+            (Value::Class(a), Value::Class(b)) => Rc::ptr_eq(a, b),
+            (Value::Instance(a), Value::Instance(b)) => Rc::ptr_eq(a, b),
+            (Value::BoundMethod(a), Value::BoundMethod(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -126,6 +200,9 @@ impl fmt::Display for Value {
             Value::Function(func) => write!(f, "<fn {}>", func.display_name()),
             Value::Closure(c) => write!(f, "<fn {}>", c.function.display_name()),
             Value::Native(_) => write!(f, "<native fn>"),
+            Value::Class(c) => write!(f, "{}", c.name),
+            Value::Instance(i) => write!(f, "{} instance", i.class.name),
+            Value::BoundMethod(bm) => write!(f, "<fn {}>", bm.method.function.display_name()),
         }
     }
 }
@@ -213,5 +290,59 @@ mod tests {
         assert!(!Value::Number(0.0).is_falsey(), "0 is truthy in Lox");
         assert!(!Value::Number(1.0).is_falsey());
         assert!(!Value::Str(Rc::new(String::new())).is_falsey());
+    }
+
+    #[test]
+    fn value_display_class_shows_name() {
+        let class = Rc::new(ObjClass::new(Rc::new("Animal".to_string())));
+        let v = Value::Class(class);
+        assert_eq!(format!("{v}"), "Animal");
+    }
+
+    #[test]
+    fn value_display_instance_shows_class_name_plus_instance() {
+        let class = Rc::new(ObjClass::new(Rc::new("Animal".to_string())));
+        let inst = Rc::new(ObjInstance::new(class));
+        let v = Value::Instance(inst);
+        assert_eq!(format!("{v}"), "Animal instance");
+    }
+
+    #[test]
+    fn value_display_bound_method_shows_method_name() {
+        let class = Rc::new(ObjClass::new(Rc::new("Animal".to_string())));
+        let inst = Rc::new(ObjInstance::new(class));
+        let func = ObjFunction::new(Some(Rc::new("speak".to_string())));
+        let closure = Rc::new(Closure::new(Rc::new(func)));
+        let bm = Rc::new(ObjBoundMethod {
+            receiver: Value::Instance(inst),
+            method: closure,
+        });
+        assert_eq!(format!("{}", Value::BoundMethod(bm)), "<fn speak>");
+    }
+
+    #[test]
+    fn value_equals_class_uses_rc_identity() {
+        let a = Rc::new(ObjClass::new(Rc::new("A".to_string())));
+        let b = Rc::new(ObjClass::new(Rc::new("A".to_string())));
+        assert!(Value::Class(a.clone()).equals(&Value::Class(a.clone())));
+        assert!(!Value::Class(a).equals(&Value::Class(b)));
+    }
+
+    #[test]
+    fn class_find_method_returns_inserted_closure() {
+        let class = ObjClass::new(Rc::new("C".to_string()));
+        let func = Rc::new(ObjFunction::new(Some(Rc::new("m".to_string()))));
+        let closure = Rc::new(Closure::new(func));
+        let key = Rc::new("m".to_string());
+        class.methods.borrow_mut().insert(key.clone(), closure);
+        assert!(class.find_method(&key).is_some());
+        assert!(class.find_method(&Rc::new("nope".to_string())).is_none());
+    }
+
+    #[test]
+    fn instance_is_truthy() {
+        let class = Rc::new(ObjClass::new(Rc::new("A".to_string())));
+        let inst = Rc::new(ObjInstance::new(class));
+        assert!(!Value::Instance(inst).is_falsey());
     }
 }

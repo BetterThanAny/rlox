@@ -1,9 +1,7 @@
 //! Stack-based bytecode VM. Ports *Crafting Interpreters* chapters 15
 //! (execution loop), 18–22 (types, globals, locals), 23 (jumps / control
-//! flow), 24 (functions + calls), and 25 (closures).
-//!
-//! Chapter 26+ (classes, methods, inheritance) lands in M6; the opcodes for
-//! those instructions simply fail with a runtime error here.
+//! flow), 24 (functions + calls), 25 (closures), and 27–29 (classes,
+//! methods, inheritance, `this`/`super`).
 //!
 //! Design notes:
 //! * Frames live in a `Vec<CallFrame>`; the active frame is `frames.last_mut()`.
@@ -21,6 +19,11 @@
 //!   the `makeCounter` test work: after the outer frame returns, the cell
 //!   still holds the captured value and the inner closure can keep reading
 //!   and writing it.
+//! * Classes use `Rc<ObjClass>` + `Rc<ObjInstance>` + `Rc<ObjBoundMethod>`
+//!   as the heap representation. Methods are plain `Rc<Closure>` entries in
+//!   `ObjClass.methods`. `OP_INHERIT` copies the parent's methods into the
+//!   child so method resolution stays a single hash-map probe. (M6-GC: the
+//!   follow-up milestone replaces these `Rc`s with GC-managed raw pointers.)
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -30,7 +33,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::chunk::OpCode;
 use crate::compiler::compile;
-use crate::value::{Closure, NativeFn, UpvalueCell, Value};
+use crate::value::{Closure, NativeFn, ObjBoundMethod, ObjClass, ObjInstance, UpvalueCell, Value};
 
 /// Outcome of a call to [`Vm::interpret`].
 #[derive(Debug, PartialEq, Eq)]
@@ -56,6 +59,10 @@ pub struct Vm {
     /// (stack_index, upvalue cell) pairs for locals that have been captured
     /// by a closure but not yet closed over. Maintained in stack-index order.
     open_upvalues: Vec<(usize, UpvalueCell)>,
+    /// Pre-interned `"init"` string used to short-circuit `OP_CALL` on a
+    /// class value (book chapter 28). M6-GC: replaces with raw ptr into the
+    /// GC-managed string table.
+    init_string: Rc<String>,
     output: Box<dyn Write>,
 }
 
@@ -74,6 +81,7 @@ impl Vm {
             stack: Vec::with_capacity(256),
             globals: HashMap::new(),
             open_upvalues: Vec::new(),
+            init_string: Rc::new("init".to_string()),
             output: Box::new(io::stdout()),
         };
         vm.define_native("clock", clock_native);
@@ -335,16 +343,216 @@ impl Vm {
                     }
                     self.stack.push(result);
                 }
-                OpCode::Invoke
-                | OpCode::SuperInvoke
-                | OpCode::Class
-                | OpCode::Inherit
-                | OpCode::Method
-                | OpCode::GetProperty
-                | OpCode::SetProperty
-                | OpCode::GetSuper => {
-                    self.runtime_error("Classes are not supported yet (M6).");
-                    return InterpretResult::RuntimeError;
+                OpCode::Class => {
+                    let name = match self.read_constant() {
+                        Value::Str(s) => s,
+                        _ => {
+                            self.runtime_error("Class name constant is not a string.");
+                            return InterpretResult::RuntimeError;
+                        }
+                    };
+                    self.stack.push(Value::Class(Rc::new(ObjClass::new(name))));
+                }
+                OpCode::Inherit => {
+                    // Stack shape: [.., superclass, subclass (TOS)]. Book
+                    // chapter 29.
+                    let n = self.stack.len();
+                    if n < 2 {
+                        self.runtime_error("Internal: OP_INHERIT underflow.");
+                        return InterpretResult::RuntimeError;
+                    }
+                    let superclass = match &self.stack[n - 2] {
+                        Value::Class(c) => c.clone(),
+                        _ => {
+                            self.runtime_error("Superclass must be a class.");
+                            return InterpretResult::RuntimeError;
+                        }
+                    };
+                    let subclass = match &self.stack[n - 1] {
+                        Value::Class(c) => c.clone(),
+                        _ => {
+                            self.runtime_error("Internal: OP_INHERIT expects a class.");
+                            return InterpretResult::RuntimeError;
+                        }
+                    };
+                    // Copy all entries — the child inherits the parent's
+                    // method table so future `find_method` calls don't have
+                    // to walk a chain. Per-method overrides happen as later
+                    // OP_METHOD instructions write to the same table.
+                    {
+                        let src = superclass.methods.borrow();
+                        let mut dst = subclass.methods.borrow_mut();
+                        for (k, v) in src.iter() {
+                            dst.insert(k.clone(), v.clone());
+                        }
+                    }
+                    // Leave the superclass on the stack (the compiler stored
+                    // it in a synthetic local named `"super"` earlier), pop
+                    // the subclass.
+                    self.stack.pop();
+                }
+                OpCode::Method => {
+                    let name = match self.read_constant() {
+                        Value::Str(s) => s,
+                        _ => {
+                            self.runtime_error("Method name constant is not a string.");
+                            return InterpretResult::RuntimeError;
+                        }
+                    };
+                    let n = self.stack.len();
+                    if n < 2 {
+                        self.runtime_error("Internal: OP_METHOD underflow.");
+                        return InterpretResult::RuntimeError;
+                    }
+                    let closure = match &self.stack[n - 1] {
+                        Value::Closure(c) => c.clone(),
+                        _ => {
+                            self.runtime_error("Internal: OP_METHOD expects a closure.");
+                            return InterpretResult::RuntimeError;
+                        }
+                    };
+                    let class = match &self.stack[n - 2] {
+                        Value::Class(c) => c.clone(),
+                        _ => {
+                            self.runtime_error("Internal: OP_METHOD expects a class below.");
+                            return InterpretResult::RuntimeError;
+                        }
+                    };
+                    class.methods.borrow_mut().insert(name, closure);
+                    // Pop only the closure — the class stays on the stack
+                    // for the next OP_METHOD (or the trailing OP_POP).
+                    self.stack.pop();
+                }
+                OpCode::GetProperty => {
+                    let name = match self.read_constant() {
+                        Value::Str(s) => s,
+                        _ => {
+                            self.runtime_error("Property name constant is not a string.");
+                            return InterpretResult::RuntimeError;
+                        }
+                    };
+                    let instance = match self.stack.last() {
+                        Some(Value::Instance(i)) => i.clone(),
+                        _ => {
+                            self.runtime_error("Only instances have properties.");
+                            return InterpretResult::RuntimeError;
+                        }
+                    };
+                    // Field lookup first — shadows methods (book semantics).
+                    let field = instance.fields.borrow().get(&name).cloned();
+                    if let Some(v) = field {
+                        self.stack.pop();
+                        self.stack.push(v);
+                    } else if let Some(method) = instance.class.find_method(&name) {
+                        // Bind the method to the receiver.
+                        let receiver = self.stack.pop().unwrap_or(Value::Nil);
+                        let bm = Rc::new(ObjBoundMethod { receiver, method });
+                        self.stack.push(Value::BoundMethod(bm));
+                    } else {
+                        self.runtime_error(&format!("Undefined property '{}'.", name));
+                        return InterpretResult::RuntimeError;
+                    }
+                }
+                OpCode::SetProperty => {
+                    let name = match self.read_constant() {
+                        Value::Str(s) => s,
+                        _ => {
+                            self.runtime_error("Property name constant is not a string.");
+                            return InterpretResult::RuntimeError;
+                        }
+                    };
+                    let n = self.stack.len();
+                    if n < 2 {
+                        self.runtime_error("Internal: OP_SET_PROPERTY underflow.");
+                        return InterpretResult::RuntimeError;
+                    }
+                    let instance = match &self.stack[n - 2] {
+                        Value::Instance(i) => i.clone(),
+                        _ => {
+                            self.runtime_error("Only instances have fields.");
+                            return InterpretResult::RuntimeError;
+                        }
+                    };
+                    let value = self.stack.pop().unwrap_or(Value::Nil);
+                    instance.fields.borrow_mut().insert(name, value.clone());
+                    // Pop the instance, leave the assigned value as the
+                    // expression's result (book behaviour).
+                    self.stack.pop();
+                    self.stack.push(value);
+                }
+                OpCode::GetSuper => {
+                    // Stack: [.., this, superclass (TOS)]. Book ch. 29.
+                    let name = match self.read_constant() {
+                        Value::Str(s) => s,
+                        _ => {
+                            self.runtime_error("Super method name constant is not a string.");
+                            return InterpretResult::RuntimeError;
+                        }
+                    };
+                    let superclass = match self.stack.pop() {
+                        Some(Value::Class(c)) => c,
+                        _ => {
+                            self.runtime_error("Internal: OP_GET_SUPER expects a class.");
+                            return InterpretResult::RuntimeError;
+                        }
+                    };
+                    let receiver = self.stack.pop().unwrap_or(Value::Nil);
+                    match superclass.find_method(&name) {
+                        Some(method) => {
+                            let bm = Rc::new(ObjBoundMethod { receiver, method });
+                            self.stack.push(Value::BoundMethod(bm));
+                        }
+                        None => {
+                            self.runtime_error(&format!("Undefined property '{}'.", name));
+                            return InterpretResult::RuntimeError;
+                        }
+                    }
+                }
+                OpCode::Invoke => {
+                    let name = match self.read_constant() {
+                        Value::Str(s) => s,
+                        _ => {
+                            self.runtime_error("Method name constant is not a string.");
+                            return InterpretResult::RuntimeError;
+                        }
+                    };
+                    let argc = self.read_byte() as usize;
+                    if !self.invoke(&name, argc) {
+                        return InterpretResult::RuntimeError;
+                    }
+                }
+                OpCode::SuperInvoke => {
+                    // Stack layout right before this opcode (compiler-side):
+                    //   [.., receiver (this), arg1, ..., argN, superclass (TOS)].
+                    // OP_SUPER_INVOKE pops the superclass, looks up `name` on
+                    // it, and calls the resulting closure with `receiver` +
+                    // the argN-deep argument window.
+                    let name = match self.read_constant() {
+                        Value::Str(s) => s,
+                        _ => {
+                            self.runtime_error("Super method name constant is not a string.");
+                            return InterpretResult::RuntimeError;
+                        }
+                    };
+                    let argc = self.read_byte() as usize;
+                    let superclass = match self.stack.pop() {
+                        Some(Value::Class(c)) => c,
+                        _ => {
+                            self.runtime_error("Internal: OP_SUPER_INVOKE expects a class.");
+                            return InterpretResult::RuntimeError;
+                        }
+                    };
+                    match superclass.find_method(&name) {
+                        Some(method) => {
+                            if !self.call_closure(method, argc) {
+                                return InterpretResult::RuntimeError;
+                            }
+                        }
+                        None => {
+                            self.runtime_error(&format!("Undefined property '{}'.", name));
+                            return InterpretResult::RuntimeError;
+                        }
+                    }
                 }
             }
         }
@@ -532,6 +740,28 @@ impl Vm {
                 self.stack.push(result);
                 true
             }
+            Value::Class(class) => {
+                // Constructor call. Slot the new instance where the class
+                // was so `this` lands in slot 0 of the init frame (or of
+                // the caller's result slot when there's no init).
+                let instance = Rc::new(ObjInstance::new(class.clone()));
+                self.stack[callee_idx] = Value::Instance(instance);
+
+                if let Some(initializer) = class.find_method(&self.init_string) {
+                    self.call_closure(initializer, argc)
+                } else if argc != 0 {
+                    self.runtime_error(&format!("Expected 0 arguments but got {}.", argc));
+                    false
+                } else {
+                    true
+                }
+            }
+            Value::BoundMethod(bm) => {
+                // Replace the bound-method slot with the receiver so the
+                // method's slot 0 holds `this` when the frame starts.
+                self.stack[callee_idx] = bm.receiver.clone();
+                self.call_closure(bm.method.clone(), argc)
+            }
             _ => {
                 self.runtime_error("Can only call functions and classes.");
                 false
@@ -558,6 +788,38 @@ impl Vm {
             slots_base,
         });
         true
+    }
+
+    /// Book chapter 28's `invoke` helper: fast path for `receiver.method(...)`.
+    /// If the receiver has a field named `name`, fall back to calling the
+    /// field (user may have stashed a closure there). Otherwise look up
+    /// `name` in the class method table and invoke it without materialising
+    /// a bound method.
+    fn invoke(&mut self, name: &Rc<String>, argc: usize) -> bool {
+        let receiver_idx = self.stack.len() - argc - 1;
+        let receiver = self.stack[receiver_idx].clone();
+        let instance = match receiver {
+            Value::Instance(i) => i,
+            _ => {
+                self.runtime_error("Only instances have methods.");
+                return false;
+            }
+        };
+
+        // Field takes precedence over methods — if the user stored a
+        // callable in a field, `inst.field(x)` must invoke it.
+        if let Some(field) = instance.fields.borrow().get(name).cloned() {
+            self.stack[receiver_idx] = field;
+            return self.call_value(argc);
+        }
+
+        match instance.class.find_method(name) {
+            Some(method) => self.call_closure(method, argc),
+            None => {
+                self.runtime_error(&format!("Undefined property '{}'.", name));
+                false
+            }
+        }
     }
 
     // ---------- runtime errors ----------

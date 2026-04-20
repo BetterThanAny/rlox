@@ -1,5 +1,5 @@
 //! Single-pass Pratt compiler producing bytecode chunks. Port of
-//! *Crafting Interpreters* chapters 17-25 (chapter 26+ classes land in M6).
+//! *Crafting Interpreters* chapters 17-29.
 //!
 //! Design notes:
 //! * The compiler owns a stack of `CompilerState` frames, one per function
@@ -8,6 +8,12 @@
 //! * Scope-depth tracking and local-resolution algorithms are verbatim book.
 //! * Upvalue resolution walks frames from innermost outward, adding upvalues
 //!   to each enclosing function as necessary (book chapter 25).
+//! * A parallel `ClassCompiler` linked-list tracks the currently-compiling
+//!   class (if any), so `this`/`super` parse rules can validate their
+//!   enclosing context (book chapters 28/29).
+//! * Method compilation reserves slot 0 for `this` by naming the synthetic
+//!   local `"this"` instead of the empty-string sentinel used for
+//!   scripts/functions.
 //! * Error handling mirrors the book's panic-mode + synchronize flow; errors
 //!   accumulate inside `Parser::errors` and are returned as a `Vec<String>`
 //!   from [`compile`].
@@ -61,6 +67,11 @@ enum FunctionType {
     Script,
     /// Regular `fun` declaration.
     Function,
+    /// A class method — slot 0 holds the receiver (`this`).
+    Method,
+    /// A class `init` method — like `Method` plus the constraint that
+    /// explicit `return <value>;` is illegal (empty `return;` is allowed).
+    Initializer,
 }
 
 /// A local variable entry inside the current function's locals array.
@@ -102,13 +113,18 @@ impl CompilerState {
             scope_depth: 0,
             upvalues: Vec::new(),
         };
-        // Slot zero is reserved for the callee itself (book chapter 24). We
-        // model it with an empty-named synthetic local at depth 0 so locals
-        // indexing stays aligned with book semantics.
+        // Slot zero is reserved for the callee / receiver (book chapters 24,
+        // 28). For methods and initializers, we name it `"this"` so
+        // `named_variable("this")` resolves to this slot. For other function
+        // kinds we keep the book's empty-name sentinel.
+        let slot_zero_name = match fn_type {
+            FunctionType::Method | FunctionType::Initializer => "this".to_string(),
+            _ => String::new(),
+        };
         state.locals.push(Local {
             name: Token {
                 ttype: TokenType::Identifier,
-                lexeme: String::new(),
+                lexeme: slot_zero_name,
                 line: 0,
             },
             depth: 0,
@@ -120,6 +136,13 @@ impl CompilerState {
     fn chunk_mut(&mut self) -> &mut Chunk {
         &mut self.function.chunk
     }
+}
+
+/// Linked-list entry tracking the currently-compiling class. Only the depth
+/// and "has superclass" flag matter to the compiler — all real class state
+/// lives in the bytecode emitted as we go.
+struct ClassCompiler {
+    has_superclass: bool,
 }
 
 /// Parse-state record. Wraps the scanner and carries book-equivalent flags.
@@ -153,10 +176,12 @@ impl<'src> Parser<'src> {
 }
 
 /// Top-level compiler. Owns the frame stack (`states`) plus a parser. The
-/// innermost frame is `states.last_mut()`.
+/// innermost frame is `states.last_mut()`. `classes` stacks `ClassCompiler`
+/// entries for nested class declarations (M6).
 pub struct Compiler<'src> {
     parser: Parser<'src>,
     states: Vec<CompilerState>,
+    classes: Vec<ClassCompiler>,
 }
 
 /// Public entry point: compile `source` into an `ObjFunction` wrapping the
@@ -173,6 +198,7 @@ impl<'src> Compiler<'src> {
         Self {
             parser,
             states: vec![script_state],
+            classes: Vec::new(),
         }
     }
 
@@ -296,8 +322,14 @@ impl<'src> Compiler<'src> {
     }
 
     fn emit_return(&mut self) {
-        // Implicit nil-then-return.
-        self.emit_op(OpCode::Nil);
+        // For an initializer, surface `this` (always at slot 0) so `var x =
+        // Foo(...)` binds the newly constructed instance even when the user
+        // writes a bare `return;`. Everything else implicitly returns nil.
+        if self.state().fn_type == FunctionType::Initializer {
+            self.emit_op_byte(OpCode::GetLocal, 0);
+        } else {
+            self.emit_op(OpCode::Nil);
+        }
         self.emit_op(OpCode::Return);
     }
 
@@ -347,7 +379,9 @@ impl<'src> Compiler<'src> {
     // ---------- declaration dispatch ----------
 
     fn declaration(&mut self) {
-        if self.match_tok(TokenType::Fun) {
+        if self.match_tok(TokenType::Class) {
+            self.class_declaration();
+        } else if self.match_tok(TokenType::Fun) {
             self.fun_declaration();
         } else if self.match_tok(TokenType::Var) {
             self.var_declaration();
@@ -481,6 +515,12 @@ impl<'src> Compiler<'src> {
         if self.match_tok(TokenType::Semicolon) {
             self.emit_return();
         } else {
+            if self.state().fn_type == FunctionType::Initializer {
+                // Book chapter 28: bare `return;` is fine inside `init`, but
+                // returning an actual value is forbidden because `init` must
+                // always surface `this`.
+                self.error("Can't return a value from an initializer.");
+            }
             self.expression();
             self.consume(TokenType::Semicolon, "Expect ';' after return value.");
             self.emit_op(OpCode::Return);
@@ -580,6 +620,87 @@ impl<'src> Compiler<'src> {
         if let Some(last) = locals.last_mut() {
             last.depth = depth;
         }
+    }
+
+    // ---------- class decl ----------
+
+    fn class_declaration(&mut self) {
+        self.consume(TokenType::Identifier, "Expect class name.");
+        let class_name_tok = self.parser.previous.clone();
+        let name_constant = self.identifier_constant(&class_name_tok.lexeme);
+        self.declare_variable();
+
+        self.emit_op_byte(OpCode::Class, name_constant);
+        self.define_variable(name_constant);
+
+        // Enter a new class context so `this` and `super` parse rules can
+        // validate their surrounding lexical scope.
+        self.classes.push(ClassCompiler {
+            has_superclass: false,
+        });
+
+        if self.match_tok(TokenType::Less) {
+            self.consume(TokenType::Identifier, "Expect superclass name.");
+            // Load the superclass by name (expression).
+            let super_tok = self.parser.previous.clone();
+            self.named_variable(&super_tok, false);
+
+            if class_name_tok.lexeme == super_tok.lexeme {
+                self.error("A class can't inherit from itself.");
+            }
+
+            // Open a scope and store the superclass in a synthetic local
+            // named `"super"`, so method bodies can capture it as an
+            // upvalue. Book chapter 29.
+            self.begin_scope();
+            self.add_local(Token::synthetic(TokenType::Super, "super"));
+            self.define_variable(0);
+
+            // Now re-load the subclass so OP_INHERIT's stack shape is
+            // (superclass @ -1, subclass @ 0 — TOS).
+            self.named_variable(&class_name_tok, false);
+            self.emit_op(OpCode::Inherit);
+
+            if let Some(c) = self.classes.last_mut() {
+                c.has_superclass = true;
+            }
+        }
+
+        // Push the class back onto the stack so OP_METHOD instructions can
+        // peek it while attaching methods.
+        self.named_variable(&class_name_tok, false);
+
+        self.consume(TokenType::LeftBrace, "Expect '{' before class body.");
+        while !self.check(TokenType::RightBrace) && !self.check(TokenType::Eof) {
+            self.method();
+        }
+        self.consume(TokenType::RightBrace, "Expect '}' after class body.");
+        self.emit_op(OpCode::Pop); // pop the class we loaded above
+
+        let has_super = self
+            .classes
+            .last()
+            .map(|c| c.has_superclass)
+            .unwrap_or(false);
+        if has_super {
+            self.end_scope();
+        }
+
+        self.classes.pop();
+    }
+
+    fn method(&mut self) {
+        self.consume(TokenType::Identifier, "Expect method name.");
+        let name = self.parser.previous.lexeme.clone();
+        let constant = self.identifier_constant(&name);
+
+        let fn_type = if name == "init" {
+            FunctionType::Initializer
+        } else {
+            FunctionType::Method
+        };
+        self.function_body(fn_type);
+        self.emit_op_byte(OpCode::Method, constant);
     }
 
     // ---------- function decl ----------
@@ -920,6 +1041,73 @@ impl<'src> Compiler<'src> {
         self.patch_jump(end_jump);
     }
 
+    // ---------- class-related prefix/infix rules ----------
+
+    fn dot(&mut self, can_assign: bool) {
+        self.consume(TokenType::Identifier, "Expect property name after '.'.");
+        let name = self.parser.previous.lexeme.clone();
+        let constant = self.identifier_constant(&name);
+
+        if can_assign && self.match_tok(TokenType::Equal) {
+            self.expression();
+            self.emit_op_byte(OpCode::SetProperty, constant);
+        } else if self.match_tok(TokenType::LeftParen) {
+            // Combined "get + call" fast path emitted as a single
+            // OP_INVOKE to avoid materialising a bound method for the
+            // common `a.b()` pattern (book chapter 28).
+            let argc = self.argument_list();
+            self.emit_op_byte(OpCode::Invoke, constant);
+            self.emit_byte(argc);
+        } else {
+            self.emit_op_byte(OpCode::GetProperty, constant);
+        }
+    }
+
+    fn this_(&mut self, _can_assign: bool) {
+        if self.classes.is_empty() {
+            self.error("Can't use 'this' outside of a class.");
+            return;
+        }
+        // Assignment to `this` is forbidden — pass `can_assign = false`.
+        let tok = self.parser.previous.clone();
+        self.named_variable(&tok, false);
+    }
+
+    fn super_(&mut self, _can_assign: bool) {
+        match self.classes.last() {
+            None => {
+                self.error("Can't use 'super' outside of a class.");
+            }
+            Some(c) if !c.has_superclass => {
+                self.error("Can't use 'super' in a class with no superclass.");
+            }
+            _ => {}
+        }
+        self.consume(TokenType::Dot, "Expect '.' after 'super'.");
+        self.consume(TokenType::Identifier, "Expect superclass method name.");
+        let name = self.parser.previous.lexeme.clone();
+        let name_constant = self.identifier_constant(&name);
+
+        // Always emit `this` first (slot 0 in a method).
+        let this_tok = Token::synthetic(TokenType::This, "this");
+        self.named_variable(&this_tok, false);
+
+        if self.match_tok(TokenType::LeftParen) {
+            // `super.method(args)` — fast path: emit args, then load super
+            // so OP_SUPER_INVOKE can do the lookup + call atomically.
+            let argc = self.argument_list();
+            let super_tok = Token::synthetic(TokenType::Super, "super");
+            self.named_variable(&super_tok, false);
+            self.emit_op_byte(OpCode::SuperInvoke, name_constant);
+            self.emit_byte(argc);
+        } else {
+            // Plain `super.method` — load super, emit OP_GET_SUPER to bind.
+            let super_tok = Token::synthetic(TokenType::Super, "super");
+            self.named_variable(&super_tok, false);
+            self.emit_op_byte(OpCode::GetSuper, name_constant);
+        }
+    }
+
     // ---------- synchronize ----------
 
     fn synchronize(&mut self) {
@@ -969,7 +1157,7 @@ fn get_rule(ttype: TokenType) -> ParseRule {
         Comma => none_rule(),
         Dot => ParseRule {
             prefix: None,
-            infix: None, // Class/method access lands in M6.
+            infix: Some(|c, ca| c.dot(ca)),
             precedence: Precedence::Call,
         },
         Minus => ParseRule {
@@ -1071,8 +1259,16 @@ fn get_rule(ttype: TokenType) -> ParseRule {
         },
         Print => none_rule(),
         Return => none_rule(),
-        Super => none_rule(),
-        This => none_rule(),
+        Super => ParseRule {
+            prefix: Some(|c, ca| c.super_(ca)),
+            infix: None,
+            precedence: Precedence::None,
+        },
+        This => ParseRule {
+            prefix: Some(|c, ca| c.this_(ca)),
+            infix: None,
+            precedence: Precedence::None,
+        },
         True => ParseRule {
             prefix: Some(|c, ca| c.literal(ca)),
             infix: None,

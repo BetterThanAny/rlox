@@ -134,3 +134,115 @@ fn vm_integration_runtime_error_in_nested_call_reports() {
     // Output goes to stderr; stdout should be empty.
     assert_eq!(out, "");
 }
+
+// ---------- Milestone 6 (classes) ----------
+
+#[test]
+fn vm_integration_class_declaration_and_instantiation() {
+    let src = "\
+        class A {} \
+        print A; \
+        var a = A(); \
+        print a;";
+    let (res, out) = run(src);
+    assert_eq!(res, InterpretResult::Ok);
+    assert_eq!(out, "A\nA instance\n");
+}
+
+#[test]
+fn vm_integration_instance_field_set_and_get() {
+    let src = "\
+        class Box {} \
+        var b = Box(); \
+        b.x = 42; \
+        print b.x;";
+    let (res, out) = run(src);
+    assert_eq!(res, InterpretResult::Ok);
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn vm_integration_method_call() {
+    let src = "\
+        class Greeter { \
+          hello() { print \"hi\"; } \
+        } \
+        Greeter().hello();";
+    let (res, out) = run(src);
+    assert_eq!(res, InterpretResult::Ok);
+    assert_eq!(out, "hi\n");
+}
+
+#[test]
+fn vm_integration_this_in_method() {
+    let src = "\
+        class Named { \
+          init(n) { this.n = n; } \
+          name() { return this.n; } \
+        } \
+        print Named(\"rlox\").name();";
+    let (res, out) = run(src);
+    assert_eq!(res, InterpretResult::Ok);
+    assert_eq!(out, "rlox\n");
+}
+
+#[test]
+fn vm_integration_init_receives_args_and_binds_fields() {
+    let src = "\
+        class Point { \
+          init(x, y) { this.x = x; this.y = y; } \
+        } \
+        var p = Point(3, 4); \
+        print p.x; print p.y;";
+    let (res, out) = run(src);
+    assert_eq!(res, InterpretResult::Ok);
+    assert_eq!(out, "3\n4\n");
+}
+
+#[test]
+fn vm_integration_inheritance_inherits_methods() {
+    let src = "\
+        class A { \
+          foo() { print \"A.foo\"; } \
+        } \
+        class B < A {} \
+        B().foo();";
+    let (res, out) = run(src);
+    assert_eq!(res, InterpretResult::Ok);
+    assert_eq!(out, "A.foo\n");
+}
+
+#[test]
+fn vm_integration_super_method_call() {
+    let src = "\
+        class A { foo() { print \"A\"; } } \
+        class B < A { foo() { super.foo(); print \"B\"; } } \
+        B().foo();";
+    let (res, out) = run(src);
+    assert_eq!(res, InterpretResult::Ok);
+    assert_eq!(out, "A\nB\n");
+}
+
+#[test]
+fn vm_integration_property_not_found_runtime_error() {
+    let src = "\
+        class A {} \
+        var a = A(); \
+        print a.missing;";
+    let (res, out) = run(src);
+    assert_eq!(res, InterpretResult::RuntimeError);
+    // Error goes to stderr; stdout stays empty.
+    assert_eq!(out, "");
+}
+
+#[test]
+fn vm_integration_examples_class_lox() {
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../examples/class.lox",
+    ))
+    .expect("examples/class.lox must be readable");
+    let (res, out) = run(&src);
+    assert_eq!(res, InterpretResult::Ok);
+    assert_eq!(out, "Rex says woof!\nRex makes a sound.\n");
+}
