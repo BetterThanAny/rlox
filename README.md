@@ -3,8 +3,8 @@
 Two Rust implementations of Lox from Robert Nystrom's *Crafting Interpreters*:
 
 - `rlox-tree` — tree-walking interpreter (book's jlox equivalent).
-- `rlox-vm` — single-pass bytecode compiler + stack VM with mark-sweep GC (book's clox equivalent).
-- `test-suite` — runs the official Lox test scripts against both.
+- `rlox-vm` — single-pass bytecode compiler + stack VM with `Rc`-managed heap (book's clox equivalent; mark-sweep GC refactor deferred — see `PLAN.md`).
+- `test-suite` — runs the official 265-script Lox test suite against both.
 
 ## Build
 
@@ -24,9 +24,20 @@ cargo run -p rlox-tree                        # REPL
 
 ```
 cargo test --workspace
-cargo test -p rlox-vm --features gc_stress
-cargo run -p test-suite -- --target both
+cargo run --release -p test-suite -- --target both
 ```
+
+## Caveats
+
+- **Tree-walker recursion depth is bounded by the Rust thread stack.**
+  Deeply nested grouping or tail-recursive Lox programs that exceed ~1500
+  levels of parser recursion / ~20 000 levels of interpreter recursion will
+  abort with `fatal runtime error: stack overflow`. `rlox-vm` caps call
+  frames at 64 and reports `Stack overflow.` cleanly instead — prefer it
+  for adversarial input. See `PLAN.md` Change Log for the planned fix.
+- GC: `Rc`-based reclamation (correct for all non-cyclic programs; leaks
+  unreachable closure cycles, which the book's mark-sweep handles). The
+  `gc_stress` Cargo feature is declared but inert pending the refactor.
 
 ## Status
 
