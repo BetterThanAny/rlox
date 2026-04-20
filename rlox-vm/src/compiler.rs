@@ -162,7 +162,7 @@ pub struct Compiler<'src> {
 /// Public entry point: compile `source` into an `ObjFunction` wrapping the
 /// top-level chunk. Returns every accumulated error message on failure.
 pub fn compile(source: &str) -> Result<Rc<ObjFunction>, Vec<String>> {
-    let mut c = Compiler::new(source);
+    let c = Compiler::new(source);
     c.compile_script()
 }
 
@@ -288,11 +288,6 @@ impl<'src> Compiler<'src> {
 
     fn emit_op(&mut self, op: OpCode) {
         self.emit_byte(op.as_byte());
-    }
-
-    fn emit_bytes(&mut self, b1: u8, b2: u8) {
-        self.emit_byte(b1);
-        self.emit_byte(b2);
     }
 
     fn emit_op_byte(&mut self, op: OpCode, operand: u8) {
@@ -557,7 +552,7 @@ impl<'src> Compiler<'src> {
     }
 
     fn add_local(&mut self, name: Token) {
-        if self.state().locals.len() >= u8::MAX as usize + 1 {
+        if self.state().locals.len() > u8::MAX as usize {
             self.error("Too many local variables in function.");
             return;
         }
@@ -844,7 +839,7 @@ impl<'src> Compiler<'src> {
                 }
             }
         }
-        if self.states[state_idx].upvalues.len() == u8::MAX as usize + 1 {
+        if self.states[state_idx].upvalues.len() > u8::MAX as usize {
             self.error("Too many closure variables in function.");
             return 0;
         }
@@ -1282,10 +1277,7 @@ mod compile_tests {
     #[test]
     fn compile_return_at_top_level_errors() {
         let errs = compile("return 1;").expect_err("fails");
-        assert!(
-            errs.iter().any(|m| m.contains("top-level")),
-            "got {errs:?}"
-        );
+        assert!(errs.iter().any(|m| m.contains("top-level")), "got {errs:?}");
     }
 
     #[test]
