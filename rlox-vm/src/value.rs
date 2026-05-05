@@ -72,6 +72,16 @@ impl Closure {
 /// Native function pointer. Signature matches book chapter 24 natives.
 pub type NativeFn = fn(&[Value]) -> Value;
 
+/// Host-provided callable metadata. Clox stores native functions as a bare
+/// function pointer, but the VM needs arity metadata to report call-site
+/// argument errors consistently with user functions and the tree-walk runtime.
+#[derive(Debug, Clone)]
+pub struct NativeFunction {
+    pub name: Rc<String>,
+    pub arity: usize,
+    pub function: NativeFn,
+}
+
 /// Runtime class object. Holds the method table — book chapter 27/28 keeps
 /// methods in a hash keyed by name; inheritance copies the parent's methods
 /// at `OP_INHERIT` time so resolution never walks the chain.
@@ -145,7 +155,7 @@ pub enum Value {
     /// Executable closure (function + captured upvalues).
     Closure(Rc<Closure>),
     /// Native callable.
-    Native(NativeFn),
+    Native(Rc<NativeFunction>),
     /// Class object — callable to allocate an instance.
     Class(Rc<ObjClass>),
     /// Live instance of a class.
@@ -172,7 +182,7 @@ impl Value {
             (Value::Str(a), Value::Str(b)) => Rc::ptr_eq(a, b) || **a == **b,
             (Value::Function(a), Value::Function(b)) => Rc::ptr_eq(a, b),
             (Value::Closure(a), Value::Closure(b)) => Rc::ptr_eq(a, b),
-            (Value::Native(a), Value::Native(b)) => (*a as usize) == (*b as usize),
+            (Value::Native(a), Value::Native(b)) => Rc::ptr_eq(a, b),
             (Value::Class(a), Value::Class(b)) => Rc::ptr_eq(a, b),
             (Value::Instance(a), Value::Instance(b)) => Rc::ptr_eq(a, b),
             (Value::BoundMethod(a), Value::BoundMethod(b)) => Rc::ptr_eq(a, b),

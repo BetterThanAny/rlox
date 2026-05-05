@@ -14,11 +14,9 @@
 //! * Upvalues: we keep `open_upvalues: Vec<(stack_index, UpvalueCell)>` and
 //!   redirect `OP_GET_LOCAL` / `OP_SET_LOCAL` through that map when the slot
 //!   has been hoisted. On frame exit we close everything at indices
-//!   `>= frame.slots_base` by writing the current stack value into the cell
-//!   and dropping the entry. This is the simplest construction that makes
-//!   the `makeCounter` test work: after the outer frame returns, the cell
-//!   still holds the captured value and the inner closure can keep reading
-//!   and writing it.
+//!   `>= frame.slots_base` by dropping the entry. The cell already is the
+//!   shared storage while open, so closing must not overwrite it from a stale
+//!   stack slot.
 //! * Classes use `Rc<ObjClass>` + `Rc<ObjInstance>` + `Rc<ObjBoundMethod>`
 //!   as the heap representation. Methods are plain `Rc<Closure>` entries in
 //!   `ObjClass.methods`. `OP_INHERIT` copies the parent's methods into the
@@ -33,7 +31,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::chunk::OpCode;
 use crate::compiler::compile;
-use crate::value::{Closure, NativeFn, ObjBoundMethod, ObjClass, ObjInstance, UpvalueCell, Value};
+use crate::value::{
+    Closure, NativeFn, NativeFunction, ObjBoundMethod, ObjClass, ObjInstance, UpvalueCell, Value,
+};
 
 /// Outcome of a call to [`Vm::interpret`].
 #[derive(Debug, PartialEq, Eq)]
@@ -84,7 +84,7 @@ impl Vm {
             init_string: Rc::new("init".to_string()),
             output: Box::new(io::stdout()),
         };
-        vm.define_native("clock", clock_native);
+        vm.define_native("clock", 0, clock_native);
         vm
     }
 
@@ -93,9 +93,16 @@ impl Vm {
         self.output = w;
     }
 
-    fn define_native(&mut self, name: &str, f: NativeFn) {
-        self.globals
-            .insert(Rc::new(name.to_string()), Value::Native(f));
+    fn define_native(&mut self, name: &str, arity: usize, function: NativeFn) {
+        let name = Rc::new(name.to_string());
+        self.globals.insert(
+            name.clone(),
+            Value::Native(Rc::new(NativeFunction {
+                name,
+                arity,
+                function,
+            })),
+        );
     }
 
     /// Compile `source` and run. Returns `CompileError` when the compiler
@@ -627,19 +634,12 @@ impl Vm {
         cell
     }
 
-    /// Close every upvalue at absolute index `>= last_kept`. Each closed
-    /// upvalue snapshots the current stack value into its cell so it survives
-    /// the frame's stack teardown.
+    /// Close every upvalue at absolute index `>= last_kept`.
     fn close_upvalues(&mut self, last_kept: usize) {
         let mut i = 0;
         while i < self.open_upvalues.len() {
-            let (idx, cell) = &self.open_upvalues[i];
+            let (idx, _) = &self.open_upvalues[i];
             if *idx >= last_kept {
-                // Snapshot the current stack value into the cell. After this
-                // point the cell is self-contained (lives only through Rc).
-                if let Some(v) = self.stack.get(*idx) {
-                    *cell.borrow_mut() = v.clone();
-                }
                 self.open_upvalues.swap_remove(i);
             } else {
                 i += 1;
@@ -732,9 +732,16 @@ impl Vm {
                 });
                 self.call_closure(c, argc)
             }
-            Value::Native(f) => {
+            Value::Native(native) => {
+                if argc != native.arity {
+                    self.runtime_error(&format!(
+                        "Expected {} arguments but got {}.",
+                        native.arity, argc
+                    ));
+                    return false;
+                }
                 let start = self.stack.len() - argc;
-                let result = f(&self.stack[start..]);
+                let result = (native.function)(&self.stack[start..]);
                 // Pop args + callee; push result.
                 self.stack.truncate(callee_idx);
                 self.stack.push(result);

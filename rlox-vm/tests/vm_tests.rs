@@ -123,6 +123,30 @@ fn vm_integration_two_counters_are_independent() {
 }
 
 #[test]
+fn vm_integration_closing_upvalue_keeps_cell_mutation() {
+    let src = "\
+        fun makeGetter() { \
+          var value = \"before\"; \
+          fun set(next) { value = next; } \
+          fun get() { return value; } \
+          set(\"after\"); \
+          return get; \
+        } \
+        var get = makeGetter(); \
+        print get();";
+    let (res, out) = run(src);
+    assert_eq!(res, InterpretResult::Ok);
+    assert_eq!(out, "after\n");
+}
+
+#[test]
+fn vm_integration_native_clock_checks_arity() {
+    let (res, out) = run("clock(1);");
+    assert_eq!(res, InterpretResult::RuntimeError);
+    assert_eq!(out, "");
+}
+
+#[test]
 fn vm_integration_runtime_error_in_nested_call_reports() {
     // 'a' - 1 triggers a runtime error inside `inner`.
     let src = "\
